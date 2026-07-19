@@ -18,7 +18,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import sys
-sys.path.append('./model/')
+sys.path.append('./model/puca_shape_shifter/')
 
 from collections import Counter
 
@@ -88,13 +88,32 @@ def interpolate_nans(array):
 
 import argparse
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("true", "t", "1", "yes", "y"):
+        return True
+    if s in ("false", "f", "0", "no", "n"):
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got {v!r}")
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--stack', type=str) 
-
+    parser.add_argument(
+        "--real_time",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="If True, run current-season real-time forecast only; if False, run retrospective cutoffs (default: False)",
+    )
     args = parser.parse_args()
-    
+    real_time = args.real_time
+    filestem = "./real_time/shape_shifter/" if real_time else "./experimental/shape_shifter/"
+    os.makedirs(filestem, exist_ok=True)
+
     THIS_SEASON = "2026/2027"
     
     #--data set of populations (contains all FIPS)
@@ -137,7 +156,7 @@ if __name__ == "__main__":
             return x
         return "{:02d}".format(int(x))
     
-    def forecast( location, season, thisweek, subset, ili_augmented ):
+    def forecast( location, season, thisweek, subset, ili_augmented, filestem ):
         print(f"Location = {location}")
         param_data = {"location":[],"season":[],"param_type":[], "param1":[],"param2":[],"value":[]}
 
@@ -150,9 +169,9 @@ if __name__ == "__main__":
         #--at the bottom of this function exactly).
         _season_slug = season.replace("/","_")
         if location=="US":
-            _outpath = "./real_time/shape_plus_deriv_forecasts/forecast_US_{:s}_{:s}.csv".format(_season_slug, thisweek)
+            _outpath = "{:s}forecast_US_{:s}_{:s}.csv".format(filestem, _season_slug, thisweek)
         else:
-            _outpath = "./real_time/shape_plus_deriv_forecasts/forecast_{:s}_{:02d}_{:s}.csv".format(_season_slug, int(location), thisweek)
+            _outpath = "{:s}forecast_{:s}_{:02d}_{:s}.csv".format(filestem, _season_slug, int(location), thisweek)
         if os.path.exists(_outpath):
             print(f"SKIP (exists): {_outpath}")
             return
@@ -336,31 +355,58 @@ if __name__ == "__main__":
         season = season.replace("/","_")
 
         if location=="US":
-            weekly_forecast_data.to_csv("./real_time/shape_plus_deriv_forecasts/forecast_US_{:s}_{:s}.csv".format(season,thisweek))
+            out_csv = "{:s}forecast_US_{:s}_{:s}.csv".format(filestem, season, thisweek)
+            out_pkl = "{:s}forecast_US_{:s}_{:s}.pkl".format(filestem, season, thisweek)
         else:
-            weekly_forecast_data.to_csv("./real_time/shape_plus_deriv_forecasts/forecast_{:s}_{:02d}_{:s}.csv".format(season,int(location),thisweek))
+            out_csv = "{:s}forecast_{:s}_{:02d}_{:s}.csv".format(filestem, season, int(location), thisweek)
+            out_pkl = "{:s}forecast_{:s}_{:02d}_{:s}.pkl".format(filestem, season, int(location), thisweek)
 
-        if location=="US":
-            pickle.dump( open("./real_time/shape_plus_deriv_forecasts/forecast_US_{:s}_{:s}.pkl".format(season,thisweek)) )
-        else:
-            pickle.dump( open("./real_time/shape_plus_deriv_forecasts/forecast_{:s}_{:02d}_{:s}.pkl".format(season,int(location),thisweek)) )
+        weekly_forecast_data.to_csv(out_csv)
+        with open(out_pkl, "wb") as f:
+            pickle.dump(yhats, f)
 
-    def tryit(location,season,thisweek,subset,ili_augmented):
-        forecast(location,season,thisweek,subset,ili_augmented)
+    def tryit(location,season,thisweek,subset,ili_augmented,filestem):
+        forecast(location,season,thisweek,subset,ili_augmented,filestem)
         
     orig_inc = inc_hosps.copy()
+    
+    if real_time:
+        season              = "2026/2027"
+        seasons             = [season]
 
-    season              = "2026/2027"
-    seasons             = [season]
-    
-    ili_augmented       = ili_augmented.loc[ili_augmented.season.isin(seasons)]
-    
-    past_inc_hosps      = orig_inc.loc[~orig_inc.season.isin(seasons)]
-    inc_hosps           = orig_inc.loc[ orig_inc.season.isin(seasons)] 
-    
-    #--Cap workers at the physical core count so we never spawn more single-
-    #--threaded fits than cores (each fit is pinned to 1 thread via the env
-    #--vars at the top of this file). loky backend re-imports this module in
-    #--each worker, so those thread caps take effect there too.
-    n_jobs = min(20, os.cpu_count() or 1)
-    Parallel(n_jobs=n_jobs, backend="loky")( delayed(tryit)(location,season,cutoff,subset,ili_augmented) for (location,season), subset in inc_hosps.groupby(["location","season"]) )
+        ili_augmented       = ili_augmented.loc[ili_augmented.season.isin(seasons)]
+
+        past_inc_hosps      = orig_inc.loc[~orig_inc.season.isin(seasons)]
+        inc_hosps           = orig_inc.loc[ orig_inc.season.isin(seasons)]
+
+        cutoff = Week.thisweek().enddate().strftime("%Y-%m-%d")
+
+        #--Cap workers at the physical core count so we never spawn more single-
+        #--threaded fits than cores (each fit is pinned to 1 thread via the env
+        #--vars at the top of this file). loky backend re-imports this module in
+        #--each worker, so those thread caps take effect there too.
+        n_jobs = min(20, os.cpu_count() or 1)
+        Parallel(n_jobs=n_jobs, backend="loky")( delayed(tryit)(location,season,cutoff,subset,ili_augmented, filestem) for (location,season), subset in inc_hosps.groupby(["location","season"]) )
+
+    else:
+        for season in ["2025/2026"]:
+
+            seasons = ["2021/2022","2022/2023","2023/2024","2024/2025", "2025/2026"]
+            # weather_data        = weather_data.loc[weather_data.season.isin(seasons)]
+            ili_augmented       = ili_augmented.loc[ili_augmented.season.isin(seasons)]
+            # pct_hosps_reporting = pct_hosps_reporting.loc[pct_hosps_reporting.season.isin(seasons)]
+
+            seasons             = [season]
+            past_inc_hosps      = orig_inc.loc[~orig_inc.season.isin(seasons)]
+            inc_hosps           = orig_inc.loc[ orig_inc.season.isin(seasons)] 
+
+            possible_cutoffs = inc_hosps.loc[inc_hosps.season==season].date.unique() 
+            for cutoff in possible_cutoffs[7:]:
+                inc_hosps_cutoff = inc_hosps.loc[inc_hosps.date<=cutoff]
+
+                #--Cap workers at the physical core count so we never spawn more single-
+                #--threaded fits than cores (each fit is pinned to 1 thread via the env
+                #--vars at the top of this file). loky backend re-imports this module in
+                #--each worker, so those thread caps take effect there too.
+                n_jobs = min(20, os.cpu_count() or 1)
+                Parallel(n_jobs=n_jobs, backend="loky")( delayed(tryit)(location,season,cutoff,subset,ili_augmented,filestem) for (location,season), subset in inc_hosps_cutoff.groupby(["location","season"]) )
